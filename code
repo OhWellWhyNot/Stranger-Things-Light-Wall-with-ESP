@@ -1,0 +1,653 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#define FASTLED_ALLOW_INTERRUPTS 0     // Cleaner timing on ESP8266
+#include <FastLED.h>
+
+// ===================== CONFIG =====================
+
+// LED strip settings 
+#define NUM_LEDS    50           // Total LEDs in the string
+#define DATA_PIN    D2           // NodeMCU D2 = GPIO4
+#define LED_TYPE    WS2811
+#define COLOR_ORDER GRB
+
+#define GLOBAL_BRIGHTNESS  250   // FastLED global cap (0–255)
+
+// Letter timing randomness
+const unsigned long BASE_LETTER_MS    = 3000;  // base dwell per character (2.5s)
+const unsigned long LETTER_JITTER_MS  = 175;   // +/- jitter in ms
+
+// New: dark gap between letters
+const unsigned long LETTER_GAP_MS     = 250;   // 0.2s dark pause between letters
+
+// Gap between full messages
+unsigned long gapInterval  = 8500;   // ms blank pause between full messages
+
+// Per-letter brightness randomness
+const uint8_t BASE_PEAK_BRIGHTNESS = 200;  // around ~60% brightness
+const uint8_t BRIGHTNESS_JITTER    = 25;   // +/- this amount
+
+CRGB leds[NUM_LEDS];
+
+// Wi-Fi AP settings
+const char* AP_SSID     = "StrangerWall";
+const char* AP_PASSWORD = "upsideDown";
+
+// Web server
+ESP8266WebServer server(80);
+
+// Message handling
+String currentMessage = "";      // Message currently being displayed
+int    currentIndex   = -1;      // Character index in currentMessage
+int    currentMsgIdx  = -1;      // Index into defaultMessages for presets, -1 for custom
+
+bool inGap = false;              // true = currently in blank gap between messages
+bool gapHasIdleAnimation = false; // whether this gap should show idle effects
+
+// New: per-letter gap state
+bool betweenLetters = false;               // true = we're in a short dark pause between letters
+unsigned long letterGapStartTime = 0;      // when the between-letter gap started
+
+// Timing for current character & animation
+unsigned long letterStartTime    = 0;  // when current letter started
+unsigned long letterDuration     = 0;  // how long this letter should be displayed
+unsigned long gapStartTime       = 0;  // when we entered a gap
+unsigned long lastAnimUpdateTime = 0;  // last time we updated LED animation
+
+// Animation state for current letter
+int8_t  currentLedIndex       = -1;   // which LED (mapped via letterMap), -1 = none/blank
+uint8_t currentHue            = 0;    // color hue
+uint8_t currentPeakBrightness = 200;  // max brightness for this letter (varies)
+uint8_t currentEffectType     = 0;    // 0 = instant, 1 = ramp, 2 = pulse
+
+// ===================== AUTO REBOOT SETTINGS =====================
+const unsigned long REBOOT_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL; // 24 hours
+unsigned long bootMillis = 0;
+
+// ===================== LETTER → LED MAPPING =====================
+// LETTER → LED MAPPING
+// A maps to LED 43, B to 42, ... Z to 11, based on the physical zigzag layout.
+const uint8_t letterMap[26] = {
+  43, 42, 41, 40, 39, 38,   // A–F
+  37, 36, 23, 24, 25, 26, // G–L
+  27, 28, 29, 30, 31, 19, // M–R
+  18, 17, 16, 15, 14, 13, // S–X
+  12, 11              // Y–Z
+};
+
+int charToLedIndex(char c) {
+  c = toupper(c);
+  if (c < 'A' || c > 'Z') return -1;
+  uint8_t idx = letterMap[c - 'A'];
+  if (idx >= NUM_LEDS) return -1;
+  return (int)idx;
+}
+
+// ===================== FIFO QUEUE (10-DEEP) =====================
+
+const uint8_t QUEUE_SIZE = 10;
+String  msgQueue[QUEUE_SIZE];
+uint8_t qHead   = 0;
+uint8_t qTail   = 0;
+uint8_t qCount  = 0;
+
+// sanitize and limit message length
+String sanitizeMessage(String msg) {
+  msg.trim();
+  if (msg.length() == 0) {
+    msg = "RUN";
+  }
+  if (msg.length() > 64) {
+    msg = msg.substring(0, 64);
+  }
+  return msg;
+}
+
+// Enqueue message; if full, drop oldest to make room for new
+bool enqueueMessage(const String& msg) {
+  if (msg.length() == 0) return false;
+
+  if (qCount >= QUEUE_SIZE) {
+    // Drop oldest
+    qHead = (qHead + 1) % QUEUE_SIZE;
+    qCount--;
+  }
+  msgQueue[qTail] = msg;
+  qTail = (qTail + 1) % QUEUE_SIZE;
+  qCount++;
+  return true;
+}
+
+bool dequeueMessage(String &out) {
+  if (qCount == 0) return false;
+  out = msgQueue[qHead];
+  qHead = (qHead + 1) % QUEUE_SIZE;
+  qCount--;
+  return true;
+}
+
+// ===================== PRESET MESSAGES =====================
+
+const char* defaultMessages[] = {
+  "RUN",
+  "HELP",
+  "GET OUT",
+  "DONT TRUST HIM",
+  "ITS HERE",
+  "IM IN THE WALL",
+  "CAN YOU HEAR ME",
+  "RIGHT BEHIND YOU",
+  "DONT TURN AROUND",
+  "ITS IN THE HOUSE",
+  "WHY DID YOU LEAVE",
+  "I SEE YOU",
+  "STAY OUT",
+  "IM STILL HERE",
+  "ITS NOT OVER",
+  "WAKE UP",
+  "CHECK THE CLOSET",
+  "LOOK UNDER THE BED",
+  "ITS IN THE LIGHTS",
+  "ANSWER ME",
+  "DONT SLEEP",
+  "IM COLD",
+  "ITS YOUR FAULT",
+  "HE KNOWS",
+  "THEY KNOW",
+  "TOO LATE",
+  "DONT OPEN THE DOOR",
+  "COME FIND ME",
+  "IM DOWN HERE",
+  "GET OUT NOW",
+  "LISTEN CLOSELY",
+  "ARE YOU ALONE",
+  "TURN AROUND",
+  "BE QUIET",
+  "I SHOULD HAVE LISTENED",
+  "NEVER GONNA GIVE YOU UP",
+  "KRAMPUS IS WATCHING",
+  "WHY WONT YOU LISTEN"
+};
+const uint8_t NUM_DEFAULT_MSG = sizeof(defaultMessages) / sizeof(defaultMessages[0]);
+
+// ===================== IDLE ANIMATION STATE =====================
+
+struct IdlePulse {
+  int      center;    // center LED index
+  uint8_t  radius;    // how many neighbors to light
+  uint8_t  hue;       // color
+  uint8_t  maxVal;    // peak brightness
+  uint8_t  age;       // current frame
+  uint8_t  lifetime;  // total frames
+  bool     active;
+};
+
+const uint8_t MAX_IDLE_PULSES = 4;
+IdlePulse idlePulses[MAX_IDLE_PULSES];
+
+// ===================== LED HELPERS & ANIMATION =====================
+
+void clearLeds() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CRGB::Black;
+  }
+}
+
+// Idle animation: twinkles + cluster flares during SOME gaps (1 in 10)
+void runIdleAnimation() {
+  static unsigned long lastIdleUpdate = 0;
+  unsigned long now = millis();
+  if (now - lastIdleUpdate < 50) return;  // ~20 FPS
+  lastIdleUpdate = now;
+
+  // Slowly fade everything out
+  fadeToBlackBy(leds, NUM_LEDS, 10);
+
+  // --- Update existing cluster pulses ---
+  for (uint8_t i = 0; i < MAX_IDLE_PULSES; i++) {
+    if (!idlePulses[i].active) continue;
+
+    IdlePulse &p = idlePulses[i];
+
+    if (p.age >= p.lifetime) {
+      p.active = false;
+      continue;
+    }
+
+    // Triangular brightness: ramp up then down over lifetime
+    float phase = (float)p.age / (float)p.lifetime;  // 0 → 1
+    float triangle = (phase < 0.5f)
+                     ? (phase * 2.0f)
+                     : ((1.0f - phase) * 2.0f);
+    uint8_t val = (uint8_t)(triangle * p.maxVal);
+
+    for (int dx = -((int)p.radius); dx <= (int)p.radius; dx++) {
+      int idx = p.center + dx;
+      if (idx < 0 || idx >= NUM_LEDS) continue;
+
+      // Optional: further falloff from center
+      uint8_t dist = abs(dx);
+      uint8_t localVal = val;
+      if (dist > 0) {
+        localVal = (uint8_t)((uint16_t)localVal * (p.radius + 1 - dist) / (p.radius + 1));
+      }
+
+      CRGB c = CHSV(p.hue, 220, localVal);
+      leds[idx] += c;  // additive so multiple pulses can overlap
+    }
+
+    p.age++;
+  }
+
+  // --- Occasionally spawn a new cluster pulse ---
+  // ~1 in ~6 idle frames
+  if (random8() < 42) {
+    // Find free slot
+    for (uint8_t i = 0; i < MAX_IDLE_PULSES; i++) {
+      if (!idlePulses[i].active) {
+        IdlePulse &p = idlePulses[i];
+        p.active   = true;
+        p.center   = random(NUM_LEDS);          // anywhere on the string
+        p.radius   = random(1, 4);              // 1–3 neighbors
+        p.hue      = random8();                 // random color
+        p.maxVal   = random8(80, 175);          // fairly dim
+        p.age      = 0;
+        p.lifetime = random8(25, 65);           // how long the flare lasts
+        break;
+      }
+    }
+  }
+
+  // --- Small random single-pixel flickers (like nervous bulbs) ---
+  if (random8() < 80) {   // ~1/3 of idle frames
+    int idx = random(NUM_LEDS);
+    uint8_t hue = random8();
+    uint8_t val = random8(30, 120);
+    leds[idx] += CHSV(hue, 200, val);
+  }
+
+  FastLED.show();
+}
+
+// Start animation state for a new letter
+void startLetterEffect(char c) {
+  letterStartTime = millis();
+
+  // Random per-letter dwell time around BASE_LETTER_MS
+  long jitter = random(- (long)LETTER_JITTER_MS, (long)LETTER_JITTER_MS + 1);
+  long dur    = (long)BASE_LETTER_MS + jitter;
+
+  // Clamp to a reasonable min/max
+  if (dur < 1500) dur = 1500;   // min 1.5s
+  if (dur > 3500) dur = 3500;   // max 3.5s
+
+  letterDuration = (unsigned long)dur;
+
+  // Map char to LED index, or blank for non-letters
+  int idx = charToLedIndex(c);
+  currentLedIndex = idx;   // -1 if non-letter
+
+  // Randomize color + peak brightness
+  currentHue = random8();
+
+  uint8_t bmin = (BASE_PEAK_BRIGHTNESS > BRIGHTNESS_JITTER)
+                 ? (BASE_PEAK_BRIGHTNESS - BRIGHTNESS_JITTER)
+                 : 0;
+  uint8_t bmax = BASE_PEAK_BRIGHTNESS + BRIGHTNESS_JITTER;
+  if (bmax > 255) bmax = 255;
+  currentPeakBrightness = random(bmin, (uint8_t)(bmax + 1));
+
+  // Randomize effect type:
+  //  ~8% instant, ~32% ramp, ~60% pulse
+  uint8_t r = random(100);
+  if (r < 8) {
+    currentEffectType = 0;  // instant on
+  } else if (r < 40) {
+    currentEffectType = 1;  // ramp up
+  } else {
+    currentEffectType = 2;  // soft pulse
+  }
+}
+
+// Compute and show current frame of the letter animation
+void updateAnimation() {
+  unsigned long now = millis();
+  if (now - lastAnimUpdateTime < 20) return;
+  lastAnimUpdateTime = now;
+
+  // If we're between messages…
+  if (inGap) {
+    if (qCount == 0 && gapHasIdleAnimation) {
+      // This gap was chosen to be "possessed"
+      runIdleAnimation();
+    } else {
+      // Either messages are queued, or this gap is a calm one
+      clearLeds();
+      FastLED.show();
+    }
+    return;
+  }
+
+  // During the small gap between letters: stay dark, nothing to animate
+  if (betweenLetters) {
+    clearLeds();
+    FastLED.show();
+    return;
+  }
+
+  // No active message or this character doesn't light a letter
+  if (currentMessage.length() == 0 || currentLedIndex < 0) {
+    clearLeds();
+    FastLED.show();
+    return;
+  }
+
+  unsigned long elapsed = now - letterStartTime;
+  if (elapsed > letterDuration) elapsed = letterDuration;
+
+  uint8_t brightness = currentPeakBrightness;
+
+  switch (currentEffectType) {
+    case 0: // instant on
+      // brightness stays at peak
+      break;
+
+    case 1: { // ramp up from 0 → peak
+      if (letterDuration != 0) {
+        uint32_t scaled = (uint32_t)currentPeakBrightness * elapsed / letterDuration;
+        brightness = (uint8_t)scaled;
+      }
+      break;
+    }
+
+    case 2: { // soft pulse (up then down)
+      if (letterDuration != 0) {
+        unsigned long half = letterDuration / 2;
+        if (half == 0) half = 1;
+        uint32_t scaled;
+        if (elapsed <= half) {
+          scaled = (uint32_t)currentPeakBrightness * elapsed * 2 / letterDuration;
+        } else {
+          unsigned long down = letterDuration - elapsed;
+          scaled = (uint32_t)currentPeakBrightness * down * 2 / letterDuration;
+        }
+        brightness = (uint8_t)scaled;
+      }
+      break;
+    }
+  }
+
+  clearLeds();
+  if (currentLedIndex >= 0 && currentLedIndex < NUM_LEDS) {
+    leds[currentLedIndex] = CHSV(currentHue, 255, brightness);
+  }
+  FastLED.show();
+}
+
+// ===================== MESSAGE FLOW (QUEUE + RANDOM) =====================
+
+// Pick the next message to display:
+// 1) Dequeue from FIFO if available
+// 2) Otherwise, random preset different from last
+void chooseNextMessage() {
+  String nextMsg;
+
+  if (dequeueMessage(nextMsg)) {
+    currentMessage = nextMsg;
+    currentMsgIdx  = -1;  // custom/user message
+  } else {
+    int newIdx = 0;
+    if (NUM_DEFAULT_MSG <= 1) {
+      newIdx = 0;
+    } else {
+      do {
+        newIdx = random(NUM_DEFAULT_MSG);
+      } while (newIdx == currentMsgIdx);
+    }
+    currentMsgIdx  = newIdx;
+    currentMessage = defaultMessages[currentMsgIdx];
+  }
+
+  betweenLetters = false;  // reset between-letter state
+
+  if (currentMessage.length() > 0) {
+    currentIndex = 0;
+    startLetterEffect(currentMessage.charAt(currentIndex));
+  } else {
+    currentIndex     = -1;
+    currentLedIndex  = -1;
+    clearLeds();
+    FastLED.show();
+  }
+}
+
+// Advance through letters / messages with gaps and randomness
+void stepMessage() {
+  if (currentMessage.length() == 0 && qCount == 0 && !inGap) {
+    // Nothing playing and nothing queued
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Handle gap between messages
+  if (inGap) {
+    if (now - gapStartTime >= gapInterval) {
+      inGap = false;
+      chooseNextMessage();
+    }
+    return;
+  }
+
+  // Handle the short dark gap between letters
+  if (betweenLetters) {
+    if (now - letterGapStartTime >= LETTER_GAP_MS) {
+      // End of letter gap → move to next letter
+      betweenLetters = false;
+      currentIndex++;
+
+      if (currentIndex >= (int)currentMessage.length()) {
+        // We've actually reached the end of the message during a letter gap
+        inGap = true;
+        gapStartTime       = now;
+        currentLedIndex    = -1;
+        gapHasIdleAnimation = (random(8) == 0);
+        clearLeds();
+        FastLED.show();
+      } else {
+        startLetterEffect(currentMessage.charAt(currentIndex));
+      }
+    }
+    return;
+  }
+
+  // If somehow we have no active message but aren't in a gap, start one
+  if (currentMessage.length() == 0) {
+    chooseNextMessage();
+    return;
+  }
+
+  // Time to move to the next letter?
+  if (now - letterStartTime >= letterDuration) {
+    // Check if this was the last character
+    if (currentIndex >= (int)currentMessage.length() - 1) {
+      // Finished last letter → enter full message gap
+      inGap = true;
+      gapStartTime       = now;
+      currentLedIndex    = -1;
+      gapHasIdleAnimation = (random(8) == 0);
+      clearLeds();
+      FastLED.show();
+    } else {
+      // Not last letter → start small dark gap between this and next letter
+      betweenLetters      = true;
+      letterGapStartTime  = now;
+      currentLedIndex     = -1;
+      clearLeds();
+      FastLED.show();
+    }
+  }
+}
+
+// ===================== WEB UI =====================
+
+String htmlPage(const String& message) {
+  String page = 
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<title>Stranger Things Wall</title>"
+    "<style>"
+      "body{font-family:Arial,sans-serif;background:#111;color:#eee;text-align:center;padding:20px;}"
+      "h1{color:#ff4444;margin-bottom:10px;}"
+      "form{margin-top:20px;}"
+      "input[type=text]{width:80%;max-width:400px;padding:10px;font-size:18px;border-radius:4px;"
+        "border:1px solid #444;background:#222;color:#eee;}"
+      "input[type=submit]{margin-top:10px;padding:10px 20px;font-size:18px;border:none;border-radius:4px;"
+        "background:#ff4444;color:#fff;cursor:pointer;}"
+      "input[type=submit]:hover{background:#ff6666;}"
+      ".preset{margin-top:20px;}"
+      ".btn{display:inline-block;margin:5px;padding:8px 14px;border-radius:4px;background:#333;color:#eee;"
+        "text-decoration:none;font-size:14px;}"
+      ".btn:hover{background:#555;}"
+      ".current{margin-top:15px;font-size:16px;color:#ccc;}"
+    "</style>"
+    "</head><body>"
+    "<h1>Stranger Things Light Wall</h1>"
+    "<p>You shouldn't be here.</p>"
+    "<form method='POST' action='/set'>"
+      "<input type='text' name='msg' placeholder='ENTER MESSAGE' value='" + message + "' />"
+      "<br>"
+      "<input type='submit' value='Send to Wall' />"
+    "</form>"
+    "<div class='current'>Currently displaying: <strong>" + message + "</strong></div>"
+    "<div class='preset'><p>Quick creepy presets:</p>";
+
+  for (uint8_t i = 0; i < NUM_DEFAULT_MSG; i++) {
+    String m = defaultMessages[i];
+    page += "<a class='btn' href='/preset?i=" + String(i) + "'>" + m + "</a>";
+  }
+
+  page +=
+    "</div>"
+    "<p style='margin-top:30px;font-size:12px;color:#555;'>"
+    "ESP8266 Stranger Wall &mdash; connect to Wi-Fi network <strong>StrangerWall</strong>, password "
+    "<strong>upsideDown</strong>, then visit <strong>192.168.4.1</strong>"
+    "</p>"
+    "</body></html>";
+
+  return page;
+}
+
+void handleRoot() {
+  String shown = currentMessage.length() ? currentMessage : "RUN";
+  server.send(200, "text/html", htmlPage(shown));
+}
+
+void handleSetMessage() {
+  if (server.hasArg("msg")) {
+    String msg = sanitizeMessage(server.arg("msg"));
+    enqueueMessage(msg);
+
+    // If nothing playing and we're not in a gap, start immediately
+    if (currentMessage.length() == 0 && !inGap && !betweenLetters) {
+      chooseNextMessage();
+    }
+  }
+  String shown = currentMessage.length() ? currentMessage : "RUN";
+  server.send(200, "text/html", htmlPage(shown));
+}
+
+void handlePreset() {
+  if (server.hasArg("i")) {
+    int idx = server.arg("i").toInt();
+    if (idx >= 0 && idx < (int)NUM_DEFAULT_MSG) {
+      String msg = sanitizeMessage(String(defaultMessages[idx]));
+      enqueueMessage(msg);
+
+      if (currentMessage.length() == 0 && !inGap && !betweenLetters) {
+        chooseNextMessage();
+      }
+    }
+  }
+  String shown = currentMessage.length() ? currentMessage : "RUN";
+  server.send(200, "text/html", htmlPage(shown));
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
+}
+
+// ===================== SETUP & LOOP =====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("Booting Stranger Things Wall...");
+
+  // LED init
+  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(GLOBAL_BRIGHTNESS);
+  clearLeds();
+  FastLED.show();
+
+  // Seed RNG for random phrase selection & animation
+  randomSeed(analogRead(A0));
+
+  // Wi-Fi AP mode
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  Serial.print("AP started. SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());  // usually 192.168.4.1
+
+  // Web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/set", HTTP_POST, handleSetMessage);
+  server.on("/preset", HTTP_GET, handlePreset);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started");
+
+  // Start with a random preset message
+  if (NUM_DEFAULT_MSG > 0) {
+    currentMsgIdx  = random(NUM_DEFAULT_MSG);
+    currentMessage = defaultMessages[currentMsgIdx];
+  } else {
+    currentMessage = "RUN";
+    currentMsgIdx  = -1;
+  }
+
+  if (currentMessage.length() > 0) {
+    currentIndex = 0;
+    startLetterEffect(currentMessage.charAt(currentIndex));
+  }
+
+  inGap               = false;
+  gapHasIdleAnimation = false;
+  betweenLetters      = false;
+  lastAnimUpdateTime  = millis();
+
+  // Initialize idle pulses as inactive
+  for (uint8_t i = 0; i < MAX_IDLE_PULSES; i++) {
+    idlePulses[i].active = false;
+  }
+
+  // Auto-reboot timer
+  bootMillis = millis();
+}
+
+void loop() {
+  server.handleClient();
+  stepMessage();      // advance letters/messages with gaps & queue
+  updateAnimation();  // animate current letter or idle mode
+
+  // --- Auto reboot "cheap insurance" ---
+  if (millis() - bootMillis >= REBOOT_INTERVAL_MS) {
+    ESP.restart();
+  }
+}
