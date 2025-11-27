@@ -6,7 +6,7 @@
 
 // ===================== CONFIG =====================
 
-// LED strip settings 
+// LED strip settings
 #define NUM_LEDS    50           // Total LEDs in the string
 #define DATA_PIN    D2           // NodeMCU D2 = GPIO4
 #define LED_TYPE    WS2811
@@ -15,17 +15,17 @@
 #define GLOBAL_BRIGHTNESS  250   // FastLED global cap (0–255)
 
 // Letter timing randomness
-const unsigned long BASE_LETTER_MS    = 3000;  // base dwell per character (2.5s)
+const unsigned long BASE_LETTER_MS    = 3000;  // base dwell per character (3s)
 const unsigned long LETTER_JITTER_MS  = 175;   // +/- jitter in ms
 
 // New: dark gap between letters
-const unsigned long LETTER_GAP_MS     = 250;   // 0.2s dark pause between letters
+const unsigned long LETTER_GAP_MS     = 250;   // 0.25s dark pause between letters
 
 // Gap between full messages
 unsigned long gapInterval  = 8500;   // ms blank pause between full messages
 
 // Per-letter brightness randomness
-const uint8_t BASE_PEAK_BRIGHTNESS = 200;  // around ~60% brightness
+const uint8_t BASE_PEAK_BRIGHTNESS = 200;  // around ~80% brightness
 const uint8_t BRIGHTNESS_JITTER    = 25;   // +/- this amount
 
 CRGB leds[NUM_LEDS];
@@ -198,7 +198,7 @@ void clearLeds() {
 void runIdleAnimation() {
   static unsigned long lastIdleUpdate = 0;
   unsigned long now = millis();
-  if (now - lastIdleUpdate < 50) return;  // ~20 FPS
+  if (now - lastIdleUpdate < 70) return;  // ~20 FPS
   lastIdleUpdate = now;
 
   // Slowly fade everything out
@@ -251,7 +251,7 @@ void runIdleAnimation() {
         p.center   = random(NUM_LEDS);          // anywhere on the string
         p.radius   = random(1, 4);              // 1–3 neighbors
         p.hue      = random8();                 // random color
-        p.maxVal   = random8(80, 175);          // fairly dim
+        p.maxVal   = random8(80, 200);          // 
         p.age      = 0;
         p.lifetime = random8(25, 65);           // how long the flare lasts
         break;
@@ -268,6 +268,7 @@ void runIdleAnimation() {
   }
 
   FastLED.show();
+  yield();
 }
 
 // Start animation state for a new letter
@@ -299,11 +300,11 @@ void startLetterEffect(char c) {
   currentPeakBrightness = random(bmin, (uint8_t)(bmax + 1));
 
   // Randomize effect type:
-  //  ~8% instant, ~32% ramp, ~60% pulse
+  //  ~1% instant, ~12% ramp, ~86% pulse
   uint8_t r = random(100);
-  if (r < 8) {
+  if (r < 1) {
     currentEffectType = 0;  // instant on
-  } else if (r < 40) {
+  } else if (r < 12) {
     currentEffectType = 1;  // ramp up
   } else {
     currentEffectType = 2;  // soft pulse
@@ -313,7 +314,7 @@ void startLetterEffect(char c) {
 // Compute and show current frame of the letter animation
 void updateAnimation() {
   unsigned long now = millis();
-  if (now - lastAnimUpdateTime < 20) return;
+  if (now - lastAnimUpdateTime < 35) return;
   lastAnimUpdateTime = now;
 
   // If we're between messages…
@@ -325,6 +326,7 @@ void updateAnimation() {
       // Either messages are queued, or this gap is a calm one
       clearLeds();
       FastLED.show();
+      yield();
     }
     return;
   }
@@ -333,6 +335,7 @@ void updateAnimation() {
   if (betweenLetters) {
     clearLeds();
     FastLED.show();
+    yield();
     return;
   }
 
@@ -340,6 +343,7 @@ void updateAnimation() {
   if (currentMessage.length() == 0 || currentLedIndex < 0) {
     clearLeds();
     FastLED.show();
+    yield();
     return;
   }
 
@@ -383,6 +387,7 @@ void updateAnimation() {
     leds[currentLedIndex] = CHSV(currentHue, 255, brightness);
   }
   FastLED.show();
+  yield();
 }
 
 // ===================== MESSAGE FLOW (QUEUE + RANDOM) =====================
@@ -419,6 +424,7 @@ void chooseNextMessage() {
     currentLedIndex  = -1;
     clearLeds();
     FastLED.show();
+    yield();
   }
 }
 
@@ -455,6 +461,7 @@ void stepMessage() {
         gapHasIdleAnimation = (random(8) == 0);
         clearLeds();
         FastLED.show();
+        yield();
       } else {
         startLetterEffect(currentMessage.charAt(currentIndex));
       }
@@ -479,6 +486,7 @@ void stepMessage() {
       gapHasIdleAnimation = (random(8) == 0);
       clearLeds();
       FastLED.show();
+      yield();
     } else {
       // Not last letter → start small dark gap between this and next letter
       betweenLetters      = true;
@@ -486,6 +494,7 @@ void stepMessage() {
       currentLedIndex     = -1;
       clearLeds();
       FastLED.show();
+      yield();
     }
   }
 }
@@ -592,6 +601,7 @@ void setup() {
   FastLED.setBrightness(GLOBAL_BRIGHTNESS);
   clearLeds();
   FastLED.show();
+  yield();
 
   // Seed RNG for random phrase selection & animation
   randomSeed(analogRead(A0));
@@ -651,3 +661,4 @@ void loop() {
     ESP.restart();
   }
 }
+
