@@ -51,7 +51,7 @@ If you are going to replicate this project, you may need to adjust this bit of c
   
   12, 11              // Y–Z
 
-I used a 50 count string of lights.  I started at the bottom left of a 36x48 board. I first ran a line along the very bottom edge (from left to right) then came up 12 inches, then ran a string right to left, then up 12 inchest, then left to right, then up a 12 inches, then right to left.  This is how I got the number to letter combination above.  Your setup may be / is likely different.  To tailor it for you, set your lights out, then count the individual LEDs starting at 0 (0 is the LED #1 in computer code.  So a 50 string of lights would have 0-49 in code).  Write down what LED should match what letter and update the code bit above.
+I used a 50 count string of lights.  I started at the bottom left of a 36x48 board. I first ran a line along the very bottom edge (from left to right) then came up 12 inches, then ran a string right to left, then up 12 inches, then left to right, then up a 12 inches, then right to left.  This is how I got the number to letter combination above.  Your setup may be / is likely different.  To tailor it for you, set your lights out, then count the individual LEDs starting at 0 (0 is the LED #1 in computer code.  So a 50 string of lights would have 0-49 in code).  Write down what LED should match what letter and update the code bit above.
 
 You can add/change any of the sayings in the program by adding
 
